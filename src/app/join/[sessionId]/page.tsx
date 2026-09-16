@@ -3,11 +3,11 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { Send, CheckCircle2, MessageSquareOff, Pause, Square } from "lucide-react";
-import { socket } from "@/lib/socket";
+import { supabase } from "@/lib/supabase";
 
 type SessionState = {
+  id: string;
   status: "active" | "paused" | "ended";
-  createdAt: Date;
 };
 
 export default function AudiencePage() {
@@ -20,38 +20,55 @@ export default function AudiencePage() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    socket.connect();
-    socket.emit("join-audience", sessionId);
+    // 1. Fetch initial session state
+    const fetchSession = async () => {
+      const { data, error: err } = await supabase
+        .from('sessions')
+        .select('*')
+        .eq('id', sessionId)
+        .single();
+      
+      if (err) {
+        setError("Session not found or connection error.");
+      } else if (data) {
+        setSession(data);
+      }
+    };
+    fetchSession();
 
-    socket.on("session-state", (state: SessionState) => {
-      setSession(state);
-    });
-
-    socket.on("error", (err: string) => {
-      setError(err);
-      setIsSending(false);
-    });
-
-    socket.on("message-sent", () => {
-      setIsSending(false);
-      setSentSuccess(true);
-      setContent("");
-    });
+    // 2. Subscribe to realtime changes on session status
+    const channel = supabase.channel(`audience_${sessionId}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'sessions', filter: `id=eq.${sessionId}` },
+        (payload) => {
+          setSession(payload.new as SessionState);
+        }
+      )
+      .subscribe();
 
     return () => {
-      socket.off("session-state");
-      socket.off("error");
-      socket.off("message-sent");
-      socket.disconnect();
+      supabase.removeChannel(channel);
     };
   }, [sessionId]);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!content.trim() || session?.status !== "active") return;
     
     setIsSending(true);
-    socket.emit("send-message", { sessionId, content: content.trim() });
+    const { error: insertError } = await supabase
+      .from('messages')
+      .insert({ session_id: sessionId, content: content.trim(), status: 'visible' });
+    
+    setIsSending(false);
+    
+    if (insertError) {
+      setError("Failed to send message. Please try again.");
+    } else {
+      setSentSuccess(true);
+      setContent("");
+    }
   };
 
   if (error && !session) {

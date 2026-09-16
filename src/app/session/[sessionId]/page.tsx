@@ -4,18 +4,19 @@ import { useEffect, useState, useRef } from "react";
 import { useParams } from "next/navigation";
 import { QRCodeSVG } from "qrcode.react";
 import { Play, Pause, Square, Trash2, EyeOff, CheckCircle } from "lucide-react";
-import { socket } from "@/lib/socket";
+import { supabase } from "@/lib/supabase";
 
 type Message = {
   id: string;
+  session_id: string;
   content: string;
-  createdAt: Date;
+  created_at: string;
   status: "visible" | "hidden" | "deleted" | "answered";
 };
 
 type SessionState = {
+  id: string;
   status: "active" | "paused" | "ended";
-  createdAt: Date;
 };
 
 export default function PresenterPage() {
@@ -34,51 +35,93 @@ export default function PresenterPage() {
   }, [sessionId]);
 
   useEffect(() => {
-    socket.connect();
-    
-    socket.emit("join-session", sessionId);
+    // 1. Fetch initial session state or create if not exists
+    const initSession = async () => {
+      const { data, error } = await supabase
+        .from('sessions')
+        .select('*')
+        .eq('id', sessionId)
+        .single();
+      
+      if (data) {
+        setSession(data);
+      } else {
+        const { data: newData } = await supabase
+          .from('sessions')
+          .insert({ id: sessionId, status: 'active' })
+          .select()
+          .single();
+        if (newData) setSession(newData);
+      }
 
-    socket.on("session-state", (state: SessionState) => {
-      setSession(state);
-    });
+      // Fetch initial messages
+      const { data: initialMessages } = await supabase
+        .from('messages')
+        .select('*')
+        .eq('session_id', sessionId)
+        .order('created_at', { ascending: true });
+      
+      if (initialMessages) {
+        setMessages(initialMessages);
+      }
+    };
+    initSession();
 
-    socket.on("all-messages", (allMsgs: Message[]) => {
-      setMessages(allMsgs);
-    });
-
-    socket.on("new-message", (msg: Message) => {
-      setMessages((prev) => [...prev, msg]);
-      setTimeout(() => {
-        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-      }, 100);
-    });
-
-    socket.on("message-updated", (updatedMsg: Message) => {
-      setMessages((prev) => 
-        prev.map(m => m.id === updatedMsg.id ? updatedMsg : m)
-      );
-    });
+    // 2. Subscribe to realtime changes
+    const channel = supabase.channel(`room_${sessionId}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'messages', filter: `session_id=eq.${sessionId}` },
+        (payload) => {
+          if (payload.eventType === 'INSERT') {
+            setMessages((prev) => [...prev, payload.new as Message]);
+            setTimeout(() => {
+              messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+            }, 100);
+          } else if (payload.eventType === 'UPDATE') {
+            setMessages((prev) => 
+              prev.map(m => m.id === payload.new.id ? (payload.new as Message) : m)
+            );
+          } else if (payload.eventType === 'DELETE') {
+            setMessages((prev) => prev.filter(m => m.id !== payload.old.id));
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'sessions', filter: `id=eq.${sessionId}` },
+        (payload) => {
+          setSession(payload.new as SessionState);
+        }
+      )
+      .subscribe();
 
     return () => {
-      socket.off("session-state");
-      socket.off("all-messages");
-      socket.off("new-message");
-      socket.off("message-updated");
-      socket.disconnect();
+      supabase.removeChannel(channel);
     };
   }, [sessionId]);
 
-  const updateSessionStatus = (status: "active" | "paused" | "ended") => {
-    socket.emit("update-session-status", { sessionId, status });
+  const updateSessionStatus = async (status: "active" | "paused" | "ended") => {
+    const { data } = await supabase
+      .from('sessions')
+      .update({ status })
+      .eq('id', sessionId)
+      .select()
+      .single();
+    if (data) setSession(data);
   };
 
-  const updateMessageStatus = (messageId: string, status: "hidden" | "deleted" | "answered") => {
-    socket.emit("update-message-status", { sessionId, messageId, status });
+  const updateMessageStatus = async (messageId: string, status: "hidden" | "deleted" | "answered") => {
+    if (status === 'deleted') {
+       await supabase.from('messages').delete().eq('id', messageId);
+    } else {
+       await supabase.from('messages').update({ status }).eq('id', messageId);
+    }
   };
 
-  const clearFeed = () => {
+  const clearFeed = async () => {
     if(confirm("Are you sure you want to clear all messages?")) {
-      socket.emit("clear-messages", { sessionId });
+      await supabase.from('messages').delete().eq('session_id', sessionId);
     }
   };
 
